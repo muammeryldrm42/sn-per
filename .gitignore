@@ -1,0 +1,9 @@
+node_modules
+.vercel
+.tanstack
+screenshots
+artifacts
+.project_id
+.grok/preview.log
+.grok/status
+dist

@@ -1,0 +1,348 @@
+import { scoreToken, type MarketToken, type ScanResult, type Scored, type SourceStatus, type Candle } from "./gate";
+
+const IGNORE = new Set([
+  "So11111111111111111111111111111111111111112",
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+]);
+
+interface DexPair {
+  chainId?: string;
+  dexId?: string;
+  url?: string;
+  baseToken?: { address?: string; name?: string; symbol?: string };
+  quoteToken?: { symbol?: string };
+  priceUsd?: string;
+  priceNative?: string;
+  txns?: {
+    m5?: { buys?: number; sells?: number };
+    h1?: { buys?: number; sells?: number };
+  };
+  volume?: { m5?: number; h1?: number; h24?: number };
+  priceChange?: { m5?: number; h1?: number; h6?: number; h24?: number };
+  liquidity?: { usd?: number };
+  fdv?: number;
+  marketCap?: number;
+  pairCreatedAt?: number;
+  info?: {
+    imageUrl?: string;
+    header?: string;
+    websites?: { url?: string }[];
+    socials?: { type?: string; url?: string }[];
+  };
+  boosts?: { active?: number };
+}
+
+interface DexMetaItem {
+  chainId?: string;
+  tokenAddress?: string;
+  description?: string;
+  icon?: string;
+  links?: { type?: string; label?: string; url?: string }[];
+  amount?: number;
+  totalAmount?: number;
+}
+
+interface Meta {
+  boosts: number;
+  dexPaid: boolean;
+  description?: string;
+  icon?: string;
+  twitter?: string;
+  website?: string;
+  telegram?: string;
+}
+
+async function getJson(url: string): Promise<unknown | null> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 9000);
+  try {
+    const res = await fetch(url, {
+      signal: ctrl.signal,
+      headers: { accept: "application/json", "user-agent": "TalonsCalls/1.0" },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function num(value: unknown): number {
+  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  return Number.isFinite(n) ? n : 0;
+}
+
+function httpUrl(value: unknown): string | undefined {
+  return typeof value === "string" && value.startsWith("http") ? value : undefined;
+}
+
+function applyLinks(meta: Meta, links: { type?: string; label?: string; url?: string }[] | undefined) {
+  for (const link of links ?? []) {
+    const url = httpUrl(link.url);
+    if (!url) continue;
+    const kind = `${link.type ?? ""} ${link.label ?? ""}`.toLowerCase();
+    if (!meta.twitter && (kind.includes("twitter") || kind.trim() === "x")) meta.twitter = url;
+    else if (!meta.telegram && kind.includes("telegram")) meta.telegram = url;
+    else if (!meta.website && (kind.includes("web") || kind.includes("site"))) meta.website = url;
+  }
+}
+
+function emptyMeta(): Meta {
+  return { boosts: 0, dexPaid: false };
+}
+
+function ingestMeta(map: Map<string, Meta>, items: DexMetaItem[], paid: boolean) {
+  let count = 0;
+  for (const item of items) {
+    if (item.chainId !== "solana" || !item.tokenAddress || IGNORE.has(item.tokenAddress)) continue;
+    count += 1;
+    const meta = map.get(item.tokenAddress) ?? emptyMeta();
+    const boost = Math.max(num(item.amount), num(item.totalAmount));
+    if (boost > meta.boosts) meta.boosts = boost;
+    if (paid) meta.dexPaid = true;
+    if (!meta.description && item.description) meta.description = item.description.slice(0, 280);
+    if (!meta.icon) meta.icon = httpUrl(item.icon);
+    applyLinks(meta, item.links);
+    map.set(item.tokenAddress, meta);
+  }
+  return count;
+}
+
+function geckoMints(payload: unknown): string[] {
+  const data = asArray((payload as { data?: unknown } | null)?.data);
+  const out: string[] = [];
+  for (const row of data) {
+    const id = (row as { relationships?: { base_token?: { data?: { id?: string } } } }).relationships?.base_token?.data?.id;
+    if (!id?.startsWith("solana_")) continue;
+    const mint = id.slice("solana_".length);
+    if (mint && !IGNORE.has(mint)) out.push(mint);
+  }
+  return out;
+}
+
+function chunks<T>(items: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
+function pickPairs(pairs: DexPair[]): Map<string, DexPair> {
+  const best = new Map<string, DexPair>();
+  for (const pair of pairs) {
+    if (pair.chainId !== "solana") continue;
+    const mint = pair.baseToken?.address;
+    if (!mint || IGNORE.has(mint)) continue;
+    const prev = best.get(mint);
+    const liq = num(pair.liquidity?.usd);
+    const prevLiq = num(prev?.liquidity?.usd);
+    if (!prev || liq > prevLiq) best.set(mint, pair);
+  }
+  return best;
+}
+
+function toToken(pair: DexPair, meta: Meta | undefined): MarketToken | null {
+  const mint = pair.baseToken?.address;
+  const symbol = pair.baseToken?.symbol?.trim();
+  const name = pair.baseToken?.name?.trim();
+  if (!mint || !symbol || !name) return null;
+  const mcap = num(pair.marketCap) || num(pair.fdv);
+  if (mcap <= 0) return null;
+  const socials = meta ?? emptyMeta();
+  for (const social of pair.info?.socials ?? []) {
+    applyLinks(socials, [{ type: social.type, url: social.url }]);
+  }
+  if (!socials.website) socials.website = httpUrl(pair.info?.websites?.[0]?.url);
+  const boosts = Math.max(socials.boosts, num(pair.boosts?.active));
+  return {
+    mint,
+    name,
+    symbol: symbol.replace(/^\$/, ""),
+    image: httpUrl(pair.info?.imageUrl) ?? socials.icon,
+    dex: pair.dexId || "dex",
+    pairUrl: httpUrl(pair.url) ?? `https://dexscreener.com/solana/${mint}`,
+    mcap,
+    fdv: num(pair.fdv) || mcap,
+    liq: num(pair.liquidity?.usd),
+    priceUsd: num(pair.priceUsd),
+    volM5: num(pair.volume?.m5),
+    volH1: num(pair.volume?.h1),
+    volH24: num(pair.volume?.h24),
+    chgM5: num(pair.priceChange?.m5),
+    chgH1: num(pair.priceChange?.h1),
+    chgH6: num(pair.priceChange?.h6),
+    chgH24: num(pair.priceChange?.h24),
+    buysM5: num(pair.txns?.m5?.buys),
+    sellsM5: num(pair.txns?.m5?.sells),
+    buysH1: num(pair.txns?.h1?.buys),
+    sellsH1: num(pair.txns?.h1?.sells),
+    createdAt: num(pair.pairCreatedAt),
+    boosts,
+    dexPaid: socials.dexPaid || Boolean(pair.info?.header) || boosts > 0,
+    twitter: socials.twitter,
+    website: socials.website,
+    telegram: socials.telegram,
+    description: socials.description,
+  };
+}
+
+function solSamples(pairs: DexPair[]): number[] {
+  const samples: number[] = [];
+  for (const pair of pairs) {
+    if (pair.quoteToken?.symbol !== "SOL") continue;
+    const usd = num(pair.priceUsd);
+    const native = num(pair.priceNative);
+    if (usd > 0 && native > 0) {
+      const sol = usd / native;
+      if (sol > 8 && sol < 5_000) samples.push(sol);
+    }
+  }
+  return samples;
+}
+
+function median(values: number[]): number | null {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+async function pairsFor(mints: string[]): Promise<{ pairs: DexPair[]; ok: boolean }> {
+  const pairs: DexPair[] = [];
+  let ok = false;
+  for (const group of chunks(mints, 30)) {
+    const payload = await getJson(`https://api.dexscreener.com/latest/dex/tokens/${group.join(",")}`);
+    const list = asArray((payload as { pairs?: unknown } | null)?.pairs) as DexPair[];
+    if (payload) ok = true;
+    pairs.push(...list);
+  }
+  return { pairs, ok };
+}
+
+function rank(tokens: Scored[]): Scored[] {
+  return tokens
+    .sort((a, b) => Number(b.called) - Number(a.called) || b.score - a.score || b.volH1 - a.volH1)
+    .slice(0, 80);
+}
+
+let cachedScan: { at: number; value: ScanResult } | null = null;
+const candleCache = new Map<string, { at: number; rows: Candle[] }>();
+
+export async function buildScan(): Promise<ScanResult> {
+  const now = Date.now();
+  if (cachedScan && now - cachedScan.at < 20_000 && cachedScan.value.tokens.length) return cachedScan.value;
+  const value = await scanFresh();
+  if (value.tokens.length) cachedScan = { at: now, value };
+  return value;
+}
+
+async function scanFresh(): Promise<ScanResult> {
+  const [boostsTop, boostsLatest, profiles, trending, freshPools] = await Promise.all([
+    getJson("https://api.dexscreener.com/token-boosts/top/v1"),
+    getJson("https://api.dexscreener.com/token-boosts/latest/v1"),
+    getJson("https://api.dexscreener.com/token-profiles/latest/v1"),
+    getJson("https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=1"),
+    getJson("https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1"),
+  ]);
+
+  const meta = new Map<string, Meta>();
+  const boostCount =
+    ingestMeta(meta, asArray(boostsTop) as DexMetaItem[], false) +
+    ingestMeta(meta, asArray(boostsLatest) as DexMetaItem[], false);
+  const profileCount = ingestMeta(meta, asArray(profiles) as DexMetaItem[], true);
+  const trendMints = geckoMints(trending);
+  const newMints = geckoMints(freshPools);
+
+  const ordered = [
+    ...trendMints,
+    ...[...meta.keys()],
+    ...newMints.slice(0, 20),
+  ];
+  const seen = new Set<string>();
+  const mints: string[] = [];
+  for (const mint of ordered) {
+    if (seen.has(mint) || IGNORE.has(mint)) continue;
+    seen.add(mint);
+    mints.push(mint);
+    if (mints.length >= 60) break;
+  }
+
+  const { pairs, ok: dexOk } = await pairsFor(mints);
+  const best = pickPairs(pairs);
+  const now = Date.now();
+  const tokens = rank(
+    [...best.values()]
+      .map((pair) => {
+        const token = toToken(pair, meta.get(pair.baseToken?.address ?? ""));
+        return token ? scoreToken(token, now) : null;
+      })
+      .filter((token): token is Scored => token !== null),
+  );
+
+  const sources: SourceStatus[] = [
+    { id: "boosts", label: "Dex boosts", ok: Boolean(boostsTop || boostsLatest), count: boostCount },
+    { id: "profiles", label: "Dex profiles", ok: Boolean(profiles), count: profileCount },
+    { id: "trending", label: "Trending pools", ok: Boolean(trending), count: trendMints.length },
+    { id: "new", label: "New pools", ok: Boolean(freshPools), count: newMints.length },
+    { id: "pairs", label: "Pair quotes", ok: dexOk, count: tokens.length },
+  ];
+
+  return {
+    tokens,
+    solUsd: median(solSamples(pairs)),
+    scannedAt: now,
+    sources,
+    error: tokens.length ? null : "Market data did not come back. Retry in a few seconds.",
+  };
+}
+
+export async function buildSearch(query: string): Promise<Scored[]> {
+  const q = query.trim().slice(0, 48);
+  if (q.length < 2) return [];
+  const payload = await getJson(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(q)}`);
+  const pairs = asArray((payload as { pairs?: unknown } | null)?.pairs) as DexPair[];
+  const best = pickPairs(pairs.filter((pair) => pair.chainId === "solana"));
+  const now = Date.now();
+  return rank(
+    [...best.values()]
+      .map((pair) => {
+        const token = toToken(pair, undefined);
+        return token ? scoreToken(token, now) : null;
+      })
+      .filter((token): token is Scored => token !== null),
+  ).slice(0, 12);
+}
+
+export async function buildCandles(mint: string): Promise<Candle[]> {
+  const hit = candleCache.get(mint);
+  if (hit && Date.now() - hit.at < 60_000) return hit.rows;
+  const rows = await candlesFresh(mint);
+  if (rows.length) candleCache.set(mint, { at: Date.now(), rows });
+  return rows;
+}
+
+async function candlesFresh(mint: string): Promise<Candle[]> {
+  const pools = await getJson(`https://api.geckoterminal.com/api/v2/networks/solana/tokens/${mint}/pools?page=1`);
+  const pool = (asArray((pools as { data?: unknown } | null)?.data)[0] as { attributes?: { address?: string } } | undefined)?.attributes?.address;
+  if (!pool) return [];
+  const ohlcv = await getJson(
+    `https://api.geckoterminal.com/api/v2/networks/solana/pools/${pool}/ohlcv/minute?aggregate=5&limit=72&currency=usd`,
+  );
+  const list = (ohlcv as { data?: { attributes?: { ohlcv_list?: unknown } } } | null)?.data?.attributes?.ohlcv_list;
+  if (!Array.isArray(list)) return [];
+  const candles: Candle[] = [];
+  for (const row of list) {
+    if (!Array.isArray(row) || row.length < 5) continue;
+    const t = num(row[0]) * 1000;
+    const c = num(row[4]);
+    if (t > 0 && c > 0) candles.push({ t, c });
+  }
+  candles.sort((a, b) => a.t - b.t);
+  return candles;
+}
