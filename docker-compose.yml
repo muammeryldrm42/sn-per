@@ -1,0 +1,55 @@
+# Talons worker, ready to run on any machine with Docker.
+#
+#   docker compose up -d                      worker only, on port 8787
+#   docker compose --profile tunnel up -d     + free Cloudflare quick tunnel (https URL in: docker compose logs tunnel)
+#   docker compose --profile https up -d      + Caddy with automatic HTTPS for DOMAIN (a VM with a public IP;
+#                                               a free DuckDNS name works), ports 80 and 443 open
+#
+# Put the https URL in NEXT_PUBLIC_WORKER_URL on Vercel and redeploy the site.
+services:
+  worker:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PORT: "8787"
+      DATA_DIR: /app/data
+    volumes:
+      - worker-data:/app/data
+    ports:
+      - "8787:8787"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+  tunnel:
+    profiles: ["tunnel"]
+    image: cloudflare/cloudflared:2024.12.2
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --url http://worker:8787
+    depends_on:
+      - worker
+
+  caddy:
+    profiles: ["https"]
+    image: caddy:2.8
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on:
+      - worker
+
+volumes:
+  worker-data:
+  caddy-data:

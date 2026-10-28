@@ -1,0 +1,8 @@
+# HTTPS in front of the worker (docker compose --profile https). Set DOMAIN in .env, e.g. talons.duckdns.org
+{$DOMAIN} {
+	encode gzip
+	reverse_proxy worker:8787 {
+		# keep the live stream (/stream) flowing instead of buffering it
+		flush_interval -1
+	}
+}
